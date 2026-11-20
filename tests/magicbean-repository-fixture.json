@@ -1,0 +1,13 @@
+{
+  "id": 5,
+  "owner": {
+    "id": 6,
+    "login": "MagicBeanDev"
+  },
+  "name": "Longshot",
+  "full_name": "MagicBeanDev/Longshot",
+  "private": false,
+  "html_url": "https://git.magicbean.dev/MagicBeanDev/Longshot",
+  "clone_url": "https://git.magicbean.dev/MagicBeanDev/Longshot.git",
+  "default_branch": "main"
+}
