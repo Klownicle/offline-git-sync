@@ -1,4 +1,4 @@
-"""Small, separately persisted progress records for dashboard-requested first runs."""
+"""Small, separately persisted progress records for dashboard-requested runs."""
 
 from datetime import datetime, timezone
 import json
@@ -31,10 +31,17 @@ def _write(base, repository, state):
     dashboard.atomic_write(_path(base, repository), json.dumps(state, separators=(",", ":")))
 
 
-def queue(base, repository):
-    """Called while the add operation still owns the repository's run lock."""
-    state = {"id": uuid.uuid4().hex, "repository": repository, "status": "queued",
-             "stage": "queued", "phase": "Waiting for the first sync to start",
+def _label(state):
+    return "Release refresh" if state.get("kind") == "refresh_releases" else "First sync"
+
+
+def queue(base, repository, kind="first_sync"):
+    """Queue progress while the caller owns the repository's run lock."""
+    if kind not in {"first_sync", "refresh_releases"}:
+        raise ValueError("Unknown dashboard sync operation")
+    phase = "Waiting for release refresh to start" if kind == "refresh_releases" else "Waiting for the first sync to start"
+    state = {"id": uuid.uuid4().hex, "repository": repository, "kind": kind, "status": "queued",
+             "stage": "queued", "phase": phase,
              "queued_at": dashboard.now(), "started_at": None, "finished_at": None,
              "pid": None, "process_identity": None, "error": None,
              "files_completed": 0, "files_total": None, "files_downloaded": 0,
@@ -64,7 +71,7 @@ def launch_failed(base, repository, identifier, error):
     with _lock(base, repository):
         state = _read(base, repository)
         if state and state["id"] == identifier and state["status"] == "queued":
-            state.update(status="failed", phase="First sync could not start",
+            state.update(status="failed", phase=f"{_label(state)} could not start",
                          error=str(error), finished_at=dashboard.now())
             _write(base, repository, state)
 
@@ -84,8 +91,8 @@ def snapshot(base, repository):
         except (KeyError, TypeError, ValueError):
             interrupted = True
     if interrupted:
-        state.update(status="interrupted", phase="First sync was interrupted",
-                     error="The first sync process is no longer running. Check the sync log for details.")
+        state.update(status="interrupted", phase=f"{_label(state)} was interrupted",
+                     error=f"The {_label(state).lower()} process is no longer running. Check the sync log for details.")
     return state
 
 
@@ -116,7 +123,7 @@ class Tracker:
     def _disable(self, error):
         self.state = None
         try:
-            self.emit(f"WARNING: first-sync progress could not update: {error}")
+            self.emit(f"WARNING: sync progress could not update: {error}")
         except Exception:
             pass
 
@@ -171,8 +178,8 @@ class Tracker:
             self.state.update(status="failed" if error else "warning" if warnings else "success",
                               stage="finished", finished_at=dashboard.now(),
                               error=str(error) if error else None,
-                              phase="First sync failed" if error else
-                                    "First sync finished with warnings" if warnings else "First sync complete")
+                              phase=f"{_label(self.state)} failed" if error else
+                                    f"{_label(self.state)} finished with warnings" if warnings else f"{_label(self.state)} complete")
             if error is None:
                 self.state.update(current_file=None, current_release=None,
                                   bytes_downloaded=0, bytes_total=None)

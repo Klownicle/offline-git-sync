@@ -17,6 +17,7 @@ import stat
 import subprocess
 import tempfile
 import time
+import uuid
 import xml.etree.ElementTree as ET
 
 import github_dashboard as dashboard
@@ -464,9 +465,9 @@ def _owns_action(sync, repository, executable, arguments):
 
 class TaskActionConflict(ValueError):
     """An actionable, read-only diagnostic; the task and config remain unchanged."""
-    def __init__(self, diagnostics):
+    def __init__(self, diagnostics, message=None):
         self.diagnostics = diagnostics
-        super().__init__("Scheduled task action is not uniquely owned by this sync; settings were not changed. "
+        super().__init__(message or "Scheduled task action is not uniquely owned by this sync; settings were not changed. "
                          "Open Scheduled task details below to review the mismatch. "
                          "Your unsaved patterns remain in the form.")
 
@@ -529,37 +530,136 @@ def _validate_add_paths(sync, jobs, repository):
         raise ValueError("The local releases path already exists and is not a directory")
 
 
-def add_sync(repository, asset_patterns, every_minutes, last, branch=None,
-             source_only=False, start_time=None, run_now=True):
+def _release_limits(job, last, separate_release_limits=_UNSET, stable_last=_UNSET,
+                    prerelease_last=_UNSET):
+    from github_releases import resolve_release_limits
+    if separate_release_limits is not _UNSET and type(separate_release_limits) is not bool:
+        raise ValueError("Separate release limits must be true or false")
+    for value in (stable_last, prerelease_last):
+        if value is not _UNSET and (type(value) is not int or not 1 <= value <= 100):
+            raise ValueError("Stable and prerelease counts must be 1–100")
+    return resolve_release_limits(job, last=last,
+        separate_release_limits=None if separate_release_limits is _UNSET else separate_release_limits,
+        stable_last=None if stable_last is _UNSET else stable_last,
+        prerelease_last=None if prerelease_last is _UNSET else prerelease_last)
+
+
+def _clear_deleted(sync, repository):
+    try:
+        sync.clear_deleted(repository)
+    except Exception as error:
+        warning = f"Sync saved, but its previous deletion marker could not be cleared: {error}"
+        try:
+            sync.emit("WARNING: " + warning)
+        except Exception:
+            pass
+        return warning
+    return None
+
+
+def _prepare_add(repository, asset_patterns, every_minutes, last, branch=None,
+                 source_only=False, start_time=None, run_now=True, *, include_prereleases=_UNSET,
+                 separate_release_limits=_UNSET, stable_last=_UNSET, prerelease_last=_UNSET,
+                 release_policy=_UNSET, detect=True):
+    from github_releases import normalize_release_policy, resolve_release_policy
     repository = normalize_repository(repository)
     patterns = validate_asset_patterns(asset_patterns)
     validate_settings(every_minutes, last, start_time)
     _validate_branch(branch)
     if type(source_only) is not bool or type(run_now) is not bool:
         raise ValueError("Source-only and run-now options must be true or false")
+    legacy = any(value is not _UNSET for value in (
+        include_prereleases, separate_release_limits, stable_last, prerelease_last))
+    include_prereleases = False if include_prereleases is _UNSET else include_prereleases
+    if type(include_prereleases) is not bool:
+        raise ValueError("Include prereleases must be true or false")
+    limits = _release_limits(None, last, separate_release_limits, stable_last, prerelease_last)
+    policy = resolve_release_policy(legacy=legacy) if release_policy is _UNSET else normalize_release_policy(release_policy)
     reference = parse_repository(repository, allow_url=False)
-    if reference.provider != "github":
+    if detect and reference.provider != "github":
         forgejo.detect_repository(reference)
     job = {"asset_patterns": patterns, "every_minutes": every_minutes, "last": last,
            "branch": branch, "source_only": source_only, "start_time": start_time,
-           "archived": False}
-    progress_id, progress_warning = None, None
+           "archived": False, "include_prereleases": include_prereleases, **limits}
+    if policy is not None:
+        job["release_policy"] = policy
+    return repository, job
+
+
+def _validate_add(sync, jobs, repository, job):
+    for existing in jobs:
+        if existing.casefold() == repository.casefold():
+            raise ValueError("This repository already has a sync, including archived syncs")
+        if task_name(existing).casefold() == task_name(repository).casefold():
+            raise ValueError(f"Scheduled task name conflicts with the existing sync {existing}")
+    _validate_add_paths(sync, jobs, repository)
+    sync.validate_jobs({**jobs, repository: job})
+
+
+def preview_add_sync(repository, asset_patterns, every_minutes, last, branch=None,
+                     source_only=False, start_time=None, run_now=True, *, include_prereleases=_UNSET,
+                     separate_release_limits=_UNSET, stable_last=_UNSET, prerelease_last=_UNSET,
+                     release_policy=_UNSET):
+    """Read-only setup synopsis. Final Add checks everything again under its locks."""
+    repository, job = _prepare_add(repository, asset_patterns, every_minutes, last, branch,
+        source_only, start_time, run_now, include_prereleases=include_prereleases,
+        separate_release_limits=separate_release_limits, stable_last=stable_last,
+        prerelease_last=prerelease_last, release_policy=release_policy)
+    sync = _sync()
+    jobs = sync.load_config() if sync.CONFIG.exists() else {}
+    _validate_add(sync, jobs, repository, job)
+    if _task_xml(repository) is not None:
+        raise ValueError("A scheduled task with this name already exists; it was not overwritten")
+    # Do not acquire mutation locks: even creating lock files would write to disk.
+    from github_asset_preview import preview as preview_assets
+    assets = preview_assets(repository, last, False,
+        include_prereleases=job["include_prereleases"],
+        separate_release_limits=job["separate_release_limits"],
+        stable_last=job["stable_last"], prerelease_last=job["prerelease_last"],
+        release_policy=job.get("release_policy"), types_only=source_only)
+    if source_only:
+        assets.update(source_only=True,
+            message="Source-only syncs update the source checkout without downloading release assets or source ZIPs.")
+    reference = parse_repository(repository, allow_url=False)
+    source, releases = reference.source_path(sync.BASE), reference.releases_path(sync.BASE)
+    return {"repository": repository, "job": job, "run_now": run_now,
+            "source_path": str(source), "releases_path": str(releases),
+            "source_exists": source.exists(), "releases_exist": releases.exists(),
+            "task_name": task_name(repository), "assets": assets}
+
+
+def add_sync(repository, asset_patterns, every_minutes, last, branch=None,
+             source_only=False, start_time=None, run_now=True, *, include_prereleases=_UNSET,
+             separate_release_limits=_UNSET, stable_last=_UNSET, prerelease_last=_UNSET,
+             release_policy=_UNSET, _catalog_descriptors=_UNSET):
+    repository, job = _prepare_add(repository, asset_patterns, every_minutes, last, branch,
+        source_only, start_time, run_now, include_prereleases=include_prereleases,
+        separate_release_limits=separate_release_limits, stable_last=stable_last,
+        prerelease_last=prerelease_last, release_policy=release_policy)
+    progress_id, progress_warning, catalog_warning, marker_warning = None, None, None, None
     from github_progress import queue, clear, launched, launch_failed, snapshot as progress_snapshot
     with _locked(repository) as sync:
         jobs = sync.load_config() if sync.CONFIG.exists() else {}
-        for existing in jobs:
-            if existing.casefold() == repository.casefold():
-                raise ValueError("This repository already has a sync, including archived syncs")
-            if task_name(existing).casefold() == task_name(repository).casefold():
-                raise ValueError(f"Scheduled task name conflicts with the existing sync {existing}")
-        _validate_add_paths(sync, jobs, repository)
+        _validate_add(sync, jobs, repository, job)
+        # A newly created lifecycle must not accept a Delete confirmation from
+        # a previous sync with otherwise identical settings and local folders.
+        # Assign only here, after the read-only Add review has been validated.
+        job["sync_generation"] = uuid.uuid4().hex
         jobs[repository] = job
-        sync.validate_jobs(jobs)
         def install(old):
             if old is not None:
                 raise ValueError("A scheduled task with this name already exists; it was not overwritten")
             _install_new(sync, repository, job)
         _commit_scheduler(sync, repository, jobs, install)
+        marker_warning = _clear_deleted(sync, repository)
+        if _catalog_descriptors is not _UNSET:
+            try:
+                from github_release_catalog import update
+                # Save the reviewed metadata before the first worker can discover
+                # fresher types; this cache failure cannot undo a committed Add.
+                update(sync.BASE, repository, _catalog_descriptors)
+            except Exception as error:
+                catalog_warning = f"Sync saved, but its release-type catalog could not be saved: {error}"
         try:
             if run_now:
                 progress_id = queue(sync.BASE, repository)
@@ -568,7 +668,7 @@ def add_sync(repository, asset_patterns, every_minutes, last, branch=None,
         except Exception as error:
             progress_warning = f"First-sync progress could not be prepared: {error}"
     result = {"repository": repository, "job": job, "started": False}
-    warnings = [progress_warning] if progress_warning else []
+    warnings = [message for message in (marker_warning, catalog_warning, progress_warning) if message]
     if run_now:
         try:
             process = _launch_saved(sync, repository)
@@ -622,12 +722,28 @@ def _job(jobs, repository):
     return dict(jobs[repository])
 
 
-def update_settings(repository, every_minutes, last, start_time=None):
+def update_settings(repository, every_minutes, last, start_time=None, *, include_prereleases=_UNSET,
+                    separate_release_limits=_UNSET, stable_last=_UNSET, prerelease_last=_UNSET,
+                    release_policy=_UNSET):
     validate_settings(every_minutes, last, start_time)
+    if include_prereleases is not _UNSET and type(include_prereleases) is not bool:
+        raise ValueError("Include prereleases must be true or false")
+    if release_policy is not _UNSET:
+        from github_releases import normalize_release_policy
+        release_policy = normalize_release_policy(release_policy)
     with _locked(repository) as sync:
         jobs = sync.load_config()
         job = _job(jobs, repository)
+        limits = _release_limits(job, last, separate_release_limits, stable_last, prerelease_last)
         job.update(every_minutes=every_minutes, last=last, start_time=start_time)
+        job.update(limits)
+        if include_prereleases is not _UNSET:
+            job["include_prereleases"] = include_prereleases
+        if release_policy is not _UNSET:
+            job["release_policy"] = release_policy
+        elif any(value is not _UNSET for value in (
+                include_prereleases, separate_release_limits, stable_last, prerelease_last)):
+            job.pop("release_policy", None)
         jobs[repository] = job
         if job.get("archived", False):
             _write_config(sync, jobs)
@@ -652,7 +768,14 @@ def archive_sync(repository):
     return job
 
 
-def resume_sync(repository, every_minutes=None, last=None, start_time=_UNSET):
+def resume_sync(repository, every_minutes=None, last=None, start_time=_UNSET, *, include_prereleases=_UNSET,
+                separate_release_limits=_UNSET, stable_last=_UNSET, prerelease_last=_UNSET,
+                release_policy=_UNSET):
+    if include_prereleases is not _UNSET and type(include_prereleases) is not bool:
+        raise ValueError("Include prereleases must be true or false")
+    if release_policy is not _UNSET:
+        from github_releases import normalize_release_policy
+        release_policy = normalize_release_policy(release_policy)
     with _locked(repository) as sync:
         jobs = sync.load_config()
         job = _job(jobs, repository)
@@ -660,7 +783,16 @@ def resume_sync(repository, every_minutes=None, last=None, start_time=_UNSET):
         release_count = last if last is not None else job["last"]
         clock_time = job.get("start_time") if start_time is _UNSET else start_time
         validate_settings(minutes, release_count, clock_time)
+        limits = _release_limits(job, release_count, separate_release_limits, stable_last, prerelease_last)
         job.update(every_minutes=minutes, last=release_count, start_time=clock_time, archived=False)
+        job.update(limits)
+        if include_prereleases is not _UNSET:
+            job["include_prereleases"] = include_prereleases
+        if release_policy is not _UNSET:
+            job["release_policy"] = release_policy
+        elif any(value is not _UNSET for value in (
+                include_prereleases, separate_release_limits, stable_last, prerelease_last)):
+            job.pop("release_policy", None)
         jobs[repository] = job
         _commit_scheduler(sync, repository, jobs, lambda old: _install(sync, repository, job))
     _render(sync)
@@ -668,20 +800,19 @@ def resume_sync(repository, every_minutes=None, last=None, start_time=_UNSET):
 
 
 def remove_sync(repository):
-    with _locked(repository) as sync:
-        jobs = sync.load_config()
-        _job(jobs, repository)
-        del jobs[repository]
-        _commit_scheduler(sync, repository, jobs, lambda old: _delete_task(repository) if old is not None else None)
-    _render(sync)
-    return {"removed": repository, "data_preserved": True}
+    from github_delete import remove_preserving_files
+    return remove_preserving_files(repository)
 
 
 def configure_sync(repository, asset_patterns, every_minutes, last, branch=None,
-                   source_only=False, start_time=None):
+                   source_only=False, start_time=None, *, include_prereleases=None,
+                   separate_release_limits=None, stable_last=None, prerelease_last=None,
+                   release_policy=None):
     """CLI setup/schedule share the same locks and transactional task updates."""
     repository = normalize_repository(repository)
     validate_settings(every_minutes, last, start_time)
+    if include_prereleases is not None and type(include_prereleases) is not bool:
+        raise ValueError("Include prereleases must be true or false")
     reference = parse_repository(repository, allow_url=False)
     if reference.provider != "github":
         forgejo.detect_repository(reference)
@@ -695,13 +826,30 @@ def configure_sync(repository, asset_patterns, every_minutes, last, branch=None,
                 raise ValueError(f"Scheduled task name conflicts with the existing sync {existing}")
         _validate_add_paths(sync, other_jobs, repository)
         job = dict(jobs.get(repository, {}))
+        if repository not in jobs:
+            job["sync_generation"] = uuid.uuid4().hex
+        from github_releases import resolve_include_prereleases, resolve_release_policy
+        selected_channel = resolve_include_prereleases(jobs.get(repository), include_prereleases)
+        legacy = any(value is not None for value in (
+            include_prereleases, separate_release_limits, stable_last, prerelease_last))
+        selected_policy = resolve_release_policy(jobs.get(repository), release_policy, legacy=legacy)
+        limits = _release_limits(jobs.get(repository), last,
+            _UNSET if separate_release_limits is None else separate_release_limits,
+            _UNSET if stable_last is None else stable_last,
+            _UNSET if prerelease_last is None else prerelease_last)
         job.update(asset_patterns=asset_patterns, every_minutes=every_minutes, last=last,
-                   branch=branch, source_only=source_only, start_time=start_time, archived=False)
+                   branch=branch, source_only=source_only, start_time=start_time, archived=False,
+                   include_prereleases=selected_channel, **limits)
+        if selected_policy is not None:
+            job["release_policy"] = selected_policy
+        elif legacy:
+            job.pop("release_policy", None)
         redirects = job.get("branch_redirects", {})
         job["branch_redirects"] = {old: new for old, new in redirects.items() if new == branch}
         jobs[repository] = job
         sync.validate_jobs(jobs)
         _commit_scheduler(sync, repository, jobs, lambda old: _install(sync, repository, job))
+        _clear_deleted(sync, repository)
     _render(sync)
     return job
 

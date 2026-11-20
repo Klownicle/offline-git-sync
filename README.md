@@ -13,10 +13,12 @@ The screenshot shows an existing installation. A fresh installation starts empty
 - Keeps a local source checkout and Git history for public GitHub repositories and compatible public Forgejo/Gitea hosts.
 - Downloads assets matching your filename patterns from the latest selected releases, plus a source ZIP for each retained release.
 - Runs scheduled syncs through Windows Task Scheduler, independently of the browser and Codex.
-- Adds and manages syncs from a local dashboard: schedules, release limits, asset patterns, and first-sync progress.
+- Discovers each repository’s release types from publisher flags and tag names, with editable grouping rules and optional limits for each type.
+- Adds and manages syncs from a local dashboard: schedules, release selection, asset patterns, and sync progress. New syncs have a review step before anything is saved.
 - Previews which assets match **all your patterns together**, without downloading them.
 - Shows actual local release counts and total **Sync Size**, including source, Git history, and all local releases; sorts by size.
 - Previews cleanup of old releases or assets that no longer match your saved patterns.
+- Refreshes a repository’s release downloads after showing exactly which local release folders will be deleted and asking for confirmation.
 - Archives a sync by removing its scheduled task while preserving its files and dashboard entry. Archived entries can still be cleaned up or resumed.
 
 “Offline” means the downloaded copies stay on your computer and can be used without the host. **Syncing and remote Asset Preview need an Internet connection.** This tool downloads files; it does not install, run, or update the applications inside those downloads. It never commits or pushes your changes upstream.
@@ -64,27 +66,35 @@ Keep all `github_*.py` files together. The installation folder also holds your d
 
 1. Click **Add sync**.
 2. Enter a GitHub `owner/repository`, a GitHub HTTPS repository URL, or the full HTTPS URL of a compatible Forgejo/Gitea repository. A bare `owner/repository` always means GitHub.
-3. Choose an interval from **5–1440 minutes**, an optional local start time, and **1–100** recent releases. `1440` means daily. A blank branch uses the default branch on the first checkout; **Source only** skips release downloads.
-4. Add asset patterns such as `*windows*x64*.zip`, `*.exe`, or `*.apk`. Patterns match case-insensitively; a file matching **any** pattern is included. `*` selects every asset. Source ZIPs are included independently of these patterns when release syncing is enabled.
-5. Open **Asset Preview** to see the combined selection, and adjust patterns before saving.
-6. Leave **Run first sync now** checked to start immediately and watch its progress, or uncheck it to wait for the schedule.
+3. Choose an interval from **5–1440 minutes**, an optional local start time, and a release limit. New syncs include **all release types**, with a shared limit of **five releases total**. `1440` minutes means daily. A blank branch uses the default branch on the first checkout; **Source only** skips release downloads.
+4. Optionally click **Discover release types**. The choices come from that repository, with example tags. Enable **Choose release types** to restrict the selection, or **Use separate release limits** to keep different counts for different types. **Customize type grouping** lets you correct inferred groups using tag patterns.
+5. Add asset patterns such as `*windows*x64*.zip`, `*.exe`, or `*.apk`. Patterns match case-insensitively; a file matching **any** pattern is included. `*` selects every asset. Source ZIPs are included independently of these patterns when release syncing is enabled. **Asset Preview** shows the combined selection before saving.
+6. Leave **Run the first sync now** checked to start immediately, or uncheck it to wait for the schedule. Click **Review sync** to inspect the repository, schedule, source branch, local folders, release types, tags, matching assets, and known download size. Click the final **Add sync** button to create it.
 
-The default selection is the latest five releases, every 15 minutes, with `*windows*x64*.zip`. Published prereleases count toward the release limit. Choose a less frequent schedule for large collections or hosts with strict API limits.
+The default selection is the latest five releases across all types, every **240 minutes (four hours)**, with `*windows*x64*.zip`. This default applies to new syncs; existing schedules stay unchanged. Limits apply after filtering by type, ordered by publication date. With separate limits, you could keep one release of one type and five of another. Source checkouts follow the configured branch independently of release selection.
+
+**All types** automatically includes new types discovered later. **Choose release types** keeps the selected list fixed; new types appear as available choices without being selected. Existing saved syncs preserve their previous selection until you edit it. Type names are inferred, so review examples and adjust grouping rules when needed. See the [usage guide](docs/usage.md) for details.
 
 ## Manage downloaded data
 
 | Dashboard control | What happens |
 | --- | --- |
-| **Manage sync** | Change the interval, optional start time, and release limit. Saving does not itself run a sync. |
+| **Manage sync** | Change the schedule, selected release types, grouping rules, and shared or separate limits. Saving does not itself run a sync or delete files. Archived syncs stay archived when settings are saved. |
+| **Check for new types** | Read the repository’s current release metadata and show discovered types and example tags. Previously seen types remain visible if temporarily unavailable. |
 | **Asset patterns** | Add, edit, or remove filename patterns. Save them to affect future downloads; changing a pattern does not delete existing files. |
-| **Asset Preview** | Fetch release metadata on demand and highlight matching assets. It does not download them or change the schedule. |
+| **Asset Preview** | Fetch release metadata using the type selection, rules, and limits currently shown in the editor, then highlight assets matching any entered filename pattern. It does not download them or save settings. |
 | **Cleanup** | Preview and then delete a chosen number of the oldest recognized local release folders, including their assets and source ZIPs. |
 | **Refresh Assets** | Preview the number, size, and examples of recognized downloaded assets that no longer match saved patterns, then confirm deletion. It does **not** download missing matches. Source ZIPs, source checkouts, metadata, and unrecognized files are preserved. |
+| **Refresh releases** | Save settings first, preview the exact local release folders and total size to delete, then explicitly confirm deletion and a new background sync using the saved selection. All contents of recognized release folders are removed, including assets, source ZIPs, and metadata. Unrecognized folders are kept. The source checkout and Git history are not deleted, though the sync can update them. Unavailable for archived or source-only syncs. |
 | **Archive / Resume** | Archive removes the scheduled task and stops sync runs but keeps all files and the dashboard entry. Resume recreates the schedule without immediately syncing. |
-| **Remove** | Remove the dashboard entry and its scheduled task. Local source, releases, and status history remain on disk. |
+| **Delete sync** | Preview and confirm removing the dashboard entry and scheduled task. **Also delete local files** starts unchecked. Leave it unchecked to keep local files; check it to preview the exact source/release folders, file count, and size before permanently deleting both complete folders. This includes Git history, local edits, manually added files, and unrecognized release data. |
 | **Refresh** | Refresh local dashboard status; this is not a “sync all now” button. |
 
-**Automatic retention deletes older recognized release folders after the selected releases download successfully.** It is separate from manual cleanup. A later active sync can download manually deleted releases again if they remain in its configured selection. Archive first if you want to stop downloads while keeping or cleaning up the local collection.
+**Automatic retention deletes recognized release folders outside the saved selection after the selected releases download successfully.** This includes releases excluded by a change to selected types, grouping rules, or limits. It is separate from manual cleanup. A later active sync can download manually deleted releases again if they remain in its configured selection. Archive first if you want to stop downloads while keeping or cleaning up the local collection.
+
+**Refresh releases deletes before downloading.** If a later download fails, removed files are not restored automatically. A failed or empty remote-selection check blocks deletion. Keep backups of downloads you cannot replace.
+
+**Delete sync and files is broader than cleanup.** It deletes the entire source and release folders shown in its preview, including files the app did not download. If deletion stops partway, completed deletions cannot be undone; the sync stays archived and the dashboard reports the remaining paths. Archive instead if you want to keep both the files and dashboard entry.
 
 ## Details and limitations
 

@@ -9,15 +9,19 @@ import os
 from pathlib import Path
 import re
 import shutil
+import stat
 import subprocess
 import sys
 import time
 import urllib.request
+import uuid
 import zipfile
 import github_dashboard as dashboard
 from github_progress import Tracker
 from github_https import urlopen
 from github_sources import parse_repository, is_repository_key, normalize_release
+from github_releases import (classify_releases, default_release_policy, normalize_release_policy, resolve_include_prereleases,
+                             resolve_release_limits, resolve_release_policy, select_releases)
 import github_forgejo as forgejo
 
 
@@ -122,6 +126,34 @@ def repository_release_page(repository, page):
     return [normalize_release(reference, release) for release in releases]
 
 
+def select_repository_releases(repository, last, include_prereleases=False, *,
+                               separate_release_limits=False, stable_last=None, prerelease_last=None,
+                               release_policy=None, on_discovery=None):
+    """Read every release page, then apply the saved channel and count."""
+    # Reject invalid options before contacting the remote service.
+    options = {"separate_release_limits": separate_release_limits,
+               "stable_last": stable_last, "prerelease_last": prerelease_last,
+               "release_policy": release_policy}
+    select_releases([], last, include_prereleases, **options)
+    reference = parse_repository(repository, allow_url=False)
+    published = []
+    for page in range(1, 100):
+        releases = repository_release_page(repository, page)
+        if not isinstance(releases, list):
+            raise RuntimeError("The repository host returned invalid release metadata")
+        if not releases:
+            break
+        published.extend(releases)
+        if reference.provider == "github" and len(releases) < 100:
+            break
+    else:
+        raise RuntimeError("Release pagination limit reached")
+    if on_discovery is not None:
+        discovered = classify_releases(published, release_policy["type_rules"] if release_policy else None)
+        on_discovery(discovered["release_types"])
+    return select_releases(published, last, include_prereleases, **options)
+
+
 def download_asset(asset, destination, previous_id, progress=None, *, headers=None, opener=None):
     if (destination.exists() and destination.stat().st_size == asset["size"]
             and previous_id == asset["id"]):
@@ -214,31 +246,122 @@ def advance_source(source, branch, run_git):
     return before, after
 
 
-def sync(repository, asset_patterns, last, branch=None, source_only=False, *, saved=False):
-    reference = parse_repository(repository)
+def _deleted_path(repository):
+    identity = parse_repository(repository, allow_url=False).key.casefold()
+    path = BASE.absolute() / ".sync-state" / (dashboard.key(identity) + ".deleted-sync.json")
+    for entry in [*reversed(path.parents), path]:
+        try:
+            info = entry.lstat()
+        except FileNotFoundError:
+            continue
+        if stat.S_ISLNK(info.st_mode) or getattr(info, "st_file_attributes", 0) & 0x400:
+            raise ValueError("Deleted sync records cannot use linked or redirected paths")
+        if entry != path and not stat.S_ISDIR(info.st_mode):
+            raise ValueError("Deleted sync record has an invalid parent directory")
+        if entry == path and not stat.S_ISREG(info.st_mode):
+            raise ValueError("Deleted sync record is not a regular file")
+    return path
+
+
+def mark_deleted(repository):
+    """Prevent a queued legacy task from recreating data after config removal.
+
+    The caller holds this repository's run lock through marker/config changes.
+    Case-insensitive identity matches the Windows paths used by the checkout.
+    """
+    path = _deleted_path(repository)
+    dashboard.atomic_write(path, json.dumps({"version": 1,
+        "repository": parse_repository(repository, allow_url=False).key.casefold(),
+        "deleted_at": dashboard.now()}) + "\n")
+
+
+def is_deleted(repository):
+    path = _deleted_path(repository)
+    try:
+        if path.stat().st_size > 4096:
+            raise ValueError("record exceeds the supported size")
+        data = json.loads(path.read_text(encoding="utf-8"))
+        if (not isinstance(data, dict) or type(data.get("version")) is not int
+                or data["version"] != 1
+                or data.get("repository") != parse_repository(repository, allow_url=False).key.casefold()
+                or not isinstance(data.get("deleted_at"), str)
+                or datetime.fromisoformat(data["deleted_at"]).tzinfo is None):
+            raise ValueError("record does not match this sync")
+    except FileNotFoundError:
+        return False
+    except (ValueError, TypeError) as error:
+        raise ValueError(f"Invalid deleted sync record; add this sync again to reset it: {error}") from error
+    return True
+
+
+def clear_deleted(repository):
+    """Clear the marker after an explicit add/configure commits successfully."""
+    _deleted_path(repository).unlink(missing_ok=True)
+
+
+def _configured_repository(repository, jobs=None):
+    if jobs is None:
+        jobs = load_config() if CONFIG.exists() else {}
+    matches = [key for key in jobs if key.casefold() == repository.casefold()]
+    if len(matches) > 1:
+        raise ValueError("Multiple configured syncs use the same Windows folder identity")
+    return matches[0] if matches else repository
+
+
+def sync(repository, asset_patterns, last, branch=None, source_only=False, *, saved=False,
+         include_prereleases=None, separate_release_limits=None, stable_last=None,
+         prerelease_last=None, release_policy=None, before_releases=None, recreate=False):
+    reference = parse_repository(_configured_repository(parse_repository(repository).key))
     repository = reference.key
     # Also prevents manual run-all from overlapping the same scheduled job.
     job_lock = BASE / ".sync-state" / (dashboard.key(repository) + ".run.lock")
     try:
         with dashboard.lock(job_lock, timeout=0):
-            configured = load_config().get(repository) if CONFIG.exists() else None
+            jobs = load_config() if CONFIG.exists() else {}
+            if _configured_repository(repository, jobs) != repository:
+                raise RuntimeError("Saved sync identity changed while starting; retry this sync")
+            configured = jobs.get(repository)
+            if configured is None and not recreate and is_deleted(repository):
+                if before_releases is not None:
+                    raise RuntimeError("This sync was deleted; refresh cancelled")
+                emit(f"{repository}: sync was deleted; invocation skipped. Add it again to resume syncing.")
+                return
             if configured and configured.get("archived", False):
+                if before_releases is not None:
+                    raise RuntimeError("This sync is archived; resume it before refreshing releases")
                 emit(f"{repository}: sync is archived; invocation skipped")
                 return
             if saved:
                 if configured is None:
+                    if before_releases is not None:
+                        raise RuntimeError("This sync is no longer configured; refresh cancelled")
                     emit(f"{repository}: sync is no longer configured; invocation skipped")
                     return
                 asset_patterns, last = configured["asset_patterns"], configured["last"]
                 branch, source_only = configured.get("branch"), configured.get("source_only", False)
+            policy = resolve_release_policy(configured, None if saved else release_policy,
+                legacy=not saved and any(value is not None for value in (
+                    include_prereleases, separate_release_limits, stable_last, prerelease_last)))
+            include_prereleases = resolve_include_prereleases(
+                configured, None if saved else include_prereleases)
+            limits = resolve_release_limits(configured, last=last,
+                separate_release_limits=None if saved else separate_release_limits,
+                stable_last=None if saved else stable_last,
+                prerelease_last=None if saved else prerelease_last)
+            if before_releases is not None and source_only:
+                raise RuntimeError("Source-only syncs cannot refresh release downloads")
             report = dashboard.Report(BASE, repository, {
                 "asset_patterns": asset_patterns, "last": last,
-                "branch": branch, "source_only": source_only}, emit)
+                "branch": branch, "source_only": source_only,
+                "include_prereleases": include_prereleases, **limits,
+                **({"release_policy": policy} if policy is not None else {})}, emit)
             progress = Tracker(BASE, repository, emit)
             try:
                 report.start()
                 report.safe(lambda: dashboard.refresh_metadata(BASE, repository, reference.headers))
-                result = _sync(repository, asset_patterns, last, branch, source_only, report, progress)
+                result = _sync(repository, asset_patterns, last, branch, source_only, report, progress,
+                               include_prereleases=include_prereleases, before_releases=before_releases,
+                               release_policy=policy, **limits)
             except Exception as error:
                 progress.finish(error)
                 report.finish(error)
@@ -251,6 +374,8 @@ def sync(repository, asset_patterns, last, branch=None, source_only=False, *, sa
                 raise
             return result
     except dashboard.LockBusy:
+        if before_releases is not None:
+            raise RuntimeError(f"{repository}: sync already running; refresh cancelled") from None
         emit(f"{repository}: sync already running; skipped duplicate invocation")
     except Exception as error:
         raise RuntimeError(f"{repository}: {error}") from error
@@ -281,7 +406,9 @@ def _is_transient_fetch_error(message):
     return any(re.search(pattern, text) for pattern in transient)
 
 
-def _sync(repository, asset_patterns, last, branch=None, source_only=False, report=None, progress=None):
+def _sync(repository, asset_patterns, last, branch=None, source_only=False, report=None, progress=None,
+          *, include_prereleases=True, separate_release_limits=False, stable_last=None,
+          prerelease_last=None, release_policy=None, before_releases=None):
     reference = parse_repository(repository)
     repository = reference.key
     if reference.provider != "github":
@@ -376,25 +503,31 @@ def _sync(repository, asset_patterns, last, branch=None, source_only=False, repo
     releases_root.mkdir(exist_ok=True)
     if progress:
         progress.stage("releases", "Finding releases and matching assets")
-    published = []
-    for page in range(1, 100):
-        releases = repository_release_page(repository, page)
-        if not releases:
-            break
-        published.extend(release for release in releases
-                         if reference.provider != "forgejo" or not release.get("draft", False))
-        if reference.provider == "github" and len(releases) < 100:
-            break
-    else:
-        raise RuntimeError("Release pagination limit reached")
-    if not published:
+    def remember_types(descriptions):
+        try:
+            from github_release_catalog import update
+            update(BASE, repository, descriptions)
+        except Exception as error:
+            message = f"Release type catalog could not update: {error}"
+            emit(f"WARNING: {repository}: {message}")
+            if report and isinstance(report.state, dict):
+                report.state.setdefault("warnings", []).append(message)
+
+    selected = select_repository_releases(repository, last, include_prereleases,
+        separate_release_limits=separate_release_limits, stable_last=stable_last,
+        prerelease_last=prerelease_last, release_policy=release_policy, on_discovery=remember_types)
+    if before_releases is not None:
+        # The caller's reviewed refresh executes under the repository lock.
+        # Source/network preflight has succeeded, but no release files have
+        # been replaced yet. Empty selections must be handled by that caller.
+        before_releases(selected)
+    if not selected:
         if progress:
             progress.plan(0)
         emit(f"{datetime.now(timezone.utc).isoformat()} {repository} "
              f"source={'updated' if initial or before != after else 'unchanged'} {after} "
-             f"releases=0 lfs={lfs_status}; no published releases, retaining existing downloads")
+             f"releases=0 lfs={lfs_status}; no matching published releases, retaining existing downloads")
         return
-    selected = sorted(published, key=lambda item: item.get("published_at") or "", reverse=True)[:last]
     if progress:
         progress.plan(sum(1 + sum(any(fnmatch.fnmatch(asset["name"].lower(), pattern.lower())
                                      for pattern in asset_patterns) for asset in release["assets"])
@@ -438,7 +571,10 @@ def _sync(repository, asset_patterns, last, branch=None, source_only=False, repo
         metadata.write_text(json.dumps(release, indent=2), encoding="utf-8")
     if progress:
         progress.stage("cleanup", "Finishing release retention")
-    removed = prune_old_releases(releases_root, {safe_name(item["tag_name"]) for item in selected})
+    # Refresh already removed exactly the folders its confirmed preview covered.
+    # Do not expand that deletion to folders created externally during downloads.
+    removed = (prune_old_releases(releases_root, {safe_name(item["tag_name"]) for item in selected})
+               if before_releases is None else 0)
     if report:
         report.removed(removed)
     summary = (f"{datetime.now(timezone.utc).isoformat()} {repository} "
@@ -490,8 +626,10 @@ def validate_jobs(jobs):
         branch = job.get("branch") if isinstance(job, dict) else None
         source_only = job.get("source_only", False) if isinstance(job, dict) else None
         archived = job.get("archived", False) if isinstance(job, dict) else None
+        include_prereleases = job.get("include_prereleases", True) if isinstance(job, dict) else None
         minutes = job.get("every_minutes") if isinstance(job, dict) else None
         start_time = job.get("start_time") if isinstance(job, dict) else None
+        generation = job.get("sync_generation") if isinstance(job, dict) else None
         if (not is_repository_key(repository) or not isinstance(patterns, list)
                 or not patterns or any(not isinstance(p, str) or not re.fullmatch(
                     r"[A-Za-z0-9.*?_-]+", p) for p in patterns)
@@ -500,10 +638,18 @@ def validate_jobs(jobs):
                     or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._/-]*", branch)
                     or ".." in branch or "//" in branch or branch.endswith(("/", ".lock"))))
                 or type(source_only) is not bool or type(archived) is not bool
+                or type(include_prereleases) is not bool
+                or ("sync_generation" in job and (not isinstance(generation, str)
+                    or not re.fullmatch(r"[0-9a-f]{32}", generation)))
                 or (minutes is not None and (type(minutes) is not int or not 5 <= minutes <= 1440))
                 or (start_time is not None and (not isinstance(start_time, str)
                     or not re.fullmatch(r"(?:[01]\d|2[0-3]):[0-5]\d", start_time)))):
             raise ValueError(f"Invalid sync configuration for {repository!r}")
+        try:
+            resolve_release_limits(job, last=last)
+            resolve_release_policy(job)
+        except ValueError:
+            raise ValueError(f"Invalid sync configuration for {repository!r}") from None
     return jobs
 
 
@@ -526,13 +672,27 @@ def resolve_run_branch(repository, branch):
 
 
 def save_config(repository, asset_patterns, last, branch=None, source_only=False,
-                every_minutes=None, start_time=None):
+                every_minutes=None, start_time=None, include_prereleases=None, *,
+                separate_release_limits=None, stable_last=None, prerelease_last=None, release_policy=None):
     with dashboard.lock(BASE / ".sync-state" / (dashboard.key(repository) + ".run.lock"), timeout=0):
         with dashboard.lock(BASE / ".sync-state" / "config.lock", timeout=0):
             jobs = load_config() if CONFIG.exists() else {}
             job = dict(jobs.get(repository, {}))
+            if repository not in jobs:
+                job["sync_generation"] = uuid.uuid4().hex
+            policy = resolve_release_policy(jobs.get(repository), release_policy,
+                legacy=any(value is not None for value in (
+                    include_prereleases, separate_release_limits, stable_last, prerelease_last)))
+            channel = resolve_include_prereleases(jobs.get(repository), include_prereleases)
+            limits = resolve_release_limits(jobs.get(repository), last=last,
+                separate_release_limits=separate_release_limits, stable_last=stable_last,
+                prerelease_last=prerelease_last)
             job.update(asset_patterns=asset_patterns, last=last, branch=branch,
-                       source_only=source_only, archived=False)
+                       source_only=source_only, archived=False, include_prereleases=channel, **limits)
+            if policy is None:
+                job.pop("release_policy", None)
+            else:
+                job["release_policy"] = policy
             if every_minutes is not None:
                 job.update(every_minutes=every_minutes, start_time=start_time)
             redirects = job.get("branch_redirects", {})
@@ -580,12 +740,39 @@ def main():
         sub.add_argument("--asset-pattern", action="append", dest="asset_patterns",
                          help="Release filename or wildcard; repeat for multiple files")
         sub.add_argument("--last", type=int, default=5,
-                         help="Keep only the latest N published releases (default: 5)")
+                         help="Keep the latest N releases matching the channel (default: 5)")
+        channel = sub.add_mutually_exclusive_group()
+        channel.add_argument("--include-prereleases", dest="include_prereleases", action="store_true",
+                             help="Include prereleases alongside stable releases")
+        channel.add_argument("--stable-only", dest="include_prereleases", action="store_false",
+                             help="Download stable releases only")
+        sub.set_defaults(include_prereleases=None)
+        limit_mode = sub.add_mutually_exclusive_group()
+        limit_mode.add_argument("--separate-release-limits", dest="separate_release_limits", action="store_true",
+                                help="Use independent stable and prerelease counts")
+        limit_mode.add_argument("--joint-release-limit", dest="separate_release_limits", action="store_false",
+                                help="Use --last as the combined release count")
+        sub.set_defaults(separate_release_limits=None)
+        sub.add_argument("--stable-last", type=int, help="Stable release count in separate mode (1–100)")
+        sub.add_argument("--prerelease-last", type=int, help="Prerelease count in separate mode (1–100)")
+        types = sub.add_mutually_exclusive_group()
+        types.add_argument("--release-type", dest="release_types", action="append",
+                           help="Select only this discovered type ID; repeat to select multiple types")
+        types.add_argument("--all-release-types", action="store_true",
+                           help="Include every discovered release type, including future types")
+        sub.add_argument("--type-limit", action="append", dest="type_limits", metavar="TYPE=COUNT",
+                         help="Set a per-type release count (1–100); repeat for multiple types")
+        policy_limits = sub.add_mutually_exclusive_group()
+        policy_limits.add_argument("--per-type-release-limits", dest="policy_limit_mode", action="store_const",
+                                   const="per_type", help="Apply independent counts to each discovered type")
+        policy_limits.add_argument("--joint-release-limits", dest="policy_limit_mode", action="store_const",
+                                   const="joint", help="Apply --last across the selected release types together")
         sub.add_argument("--branch", help="Track this branch instead of the default branch")
         sub.add_argument("--source-only", action="store_true",
                          help="Sync the branch without requiring published releases")
         if name in ("setup", "schedule"):
-            sub.add_argument("--every-minutes", type=int, default=15)
+            sub.add_argument("--every-minutes", type=int, default=240,
+                             help="Sync interval in minutes (default: 240)")
             sub.add_argument("--start-time", help="Local Windows start time, HH:MM")
     args = parser.parse_args()
     if args.command == "dashboard":
@@ -626,14 +813,47 @@ def main():
         parser.error("every-minutes must be between 5 and 1440")
     if not 1 <= args.last <= 100:
         parser.error("last must be between 1 and 100")
+    for label, value in (("stable-last", args.stable_last), ("prerelease-last", args.prerelease_last)):
+        if value is not None and not 1 <= value <= 100:
+            parser.error(f"{label} must be between 1 and 100")
+    policy = None
+    if args.release_types is not None or args.all_release_types or args.type_limits or args.policy_limit_mode:
+        if any(value is not None for value in (args.include_prereleases, args.separate_release_limits,
+                                               args.stable_last, args.prerelease_last)):
+            parser.error("Release-type options cannot be combined with legacy stable/prerelease options")
+        configured = load_config().get(args.repository) if CONFIG.exists() else None
+        policy = resolve_release_policy(configured) or default_release_policy()
+        if args.release_types is not None:
+            policy.update(mode="selected", selected_types=list(dict.fromkeys(args.release_types)))
+        elif args.all_release_types:
+            policy.update(mode="all", selected_types=[])
+        if args.type_limits:
+            policy["limit_mode"] = "per_type"
+            for value in args.type_limits:
+                identifier, separator, count = value.rpartition("=")
+                if not separator or not count.isascii() or not count.isdecimal():
+                    parser.error("type-limit must be TYPE=COUNT with a count of 1–100")
+                policy["limits"][identifier] = int(count)
+        if args.policy_limit_mode:
+            policy["limit_mode"] = args.policy_limit_mode
+        try:
+            policy = normalize_release_policy(policy)
+        except ValueError as error:
+            parser.error(str(error))
     if args.command == "setup" and CONFIG.exists() and load_config().get(args.repository, {}).get("archived", False):
         parser.error("This sync is archived. Resume it on the dashboard, or use schedule before running it.")
     if args.command != "schedule":
-        sync(args.repository, asset_patterns, args.last, args.branch, args.source_only)
+        sync(args.repository, asset_patterns, args.last, args.branch, args.source_only,
+             include_prereleases=args.include_prereleases, separate_release_limits=args.separate_release_limits,
+             stable_last=args.stable_last, prerelease_last=args.prerelease_last, release_policy=policy,
+             recreate=args.command == "setup")
     if args.command in ("setup", "schedule"):
         from github_management import configure_sync
         configure_sync(args.repository, asset_patterns, args.every_minutes, args.last,
-                       args.branch, args.source_only, args.start_time)
+                       args.branch, args.source_only, args.start_time,
+                       include_prereleases=args.include_prereleases,
+                       separate_release_limits=args.separate_release_limits,
+                       stable_last=args.stable_last, prerelease_last=args.prerelease_last, release_policy=policy)
 
 
 if __name__ == "__main__":

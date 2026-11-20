@@ -10,7 +10,12 @@ import urllib.request
 from github_https import urlopen
 from github_management import normalize_repository, _safe_name
 from github_sources import parse_repository, normalize_release
+from github_releases import (classify_releases, default_release_policy, normalize_release_policy,
+                             resolve_release_limits, select_releases)
 import github_forgejo as forgejo
+
+
+_NEW_POLICY = object()
 
 
 # A preview must never silently present a partial set of releases or assets.
@@ -89,11 +94,13 @@ class _MetadataReader:
         return result
 
 
-def preview(repository, last, source_only=False):
+def preview(repository, last, source_only=False, include_prereleases=False, *,
+            separate_release_limits=False, stable_last=None, prerelease_last=None,
+            release_policy=_NEW_POLICY, types_only=False):
     """Return release names/assets only; pattern matching happens locally in the UI.
 
     This uses the same published-at ordering and embedded assets as the actual
-    sync. In particular, prereleases are included and source ZIPs are independent
+    sync. In particular, channel selection precedes the limit and source ZIPs are independent
     of the configured asset patterns. No download URLs are returned to the UI.
     """
     repository = normalize_repository(repository)
@@ -103,9 +110,21 @@ def preview(repository, last, source_only=False):
         raise ValueError("Release count must be 1–100")
     if type(source_only) is not bool:
         raise ValueError("Source-only must be true or false")
+    if type(include_prereleases) is not bool:
+        raise ValueError("Include prereleases must be true or false")
+    if type(separate_release_limits) is not bool:
+        raise ValueError("Separate release limits must be true or false")
+    limits = resolve_release_limits(last=last, separate_release_limits=separate_release_limits,
+                                    stable_last=stable_last, prerelease_last=prerelease_last)
+    policy = (default_release_policy() if release_policy is _NEW_POLICY else
+              normalize_release_policy(release_policy) if release_policy is not None else None)
     if reference.provider != "github":
         forgejo.detect_repository(reference)
     result = {"repository": repository, "last": last, "source_only": source_only,
+              "include_prereleases": include_prereleases, **limits,
+              "release_policy": policy, "effective_policy": policy,
+              "legacy_selection": ({"include_prereleases": include_prereleases, **limits}
+                                   if policy is None else None), "release_types": [],
               "releases": [], "fetched_at": datetime.now(timezone.utc).isoformat(), "message": ""}
     if source_only:
         result["message"] = "Source-only syncs update the source checkout without downloading release assets or source ZIPs."
@@ -123,15 +142,22 @@ def preview(repository, last, source_only=False):
                 raise RuntimeError(f"{service} returned invalid release metadata ({error}); "
                                    "no partial preview was shown") from None
             _text(release.get("published_at"), "publication date", optional=True, service=service)
-            if reference.provider != "forgejo" or not release.get("draft", False):
-                published.append(release)
+            published.append(release)
         if not releases or (reference.provider == "github" and len(releases) < 100):
             break
     else:
         raise RuntimeError("This repository has too many release pages for an asset preview; "
                            "no partial preview was shown")
 
-    selected = sorted(published, key=lambda item: item.get("published_at") or "", reverse=True)[:last]
+    try:
+        discovered = classify_releases(published, policy["type_rules"] if policy else None)
+        result["release_types"] = discovered["release_types"]
+        selected = select_releases(published, last, include_prereleases, release_policy=policy, **limits)
+    except ValueError as error:
+        raise RuntimeError(f"{service} returned invalid release metadata ({error}); "
+                           "no partial preview was shown") from None
+    if types_only:
+        return result
     total_assets = 0
     for release in selected:
         tag = _text(release.get("tag_name"), "release tag", service=service)
@@ -156,7 +182,16 @@ def preview(repository, last, source_only=False):
         result["releases"].append({
             "tag": tag, "name": _text(release.get("name"), "release name", optional=True, service=service) or tag,
             "published_at": release.get("published_at"), "prerelease": bool(release.get("prerelease")),
+            "type_id": release["type_id"], "type_label": release["type_label"],
+            "type_source": release["type_source"],
             "assets": assets, "source_archive": {"name": archive_name, "size": None}})
     if not selected:
-        result["message"] = "No published releases are available. The source checkout will still sync."
+        channel = ("matching" if policy is not None else "published" if include_prereleases else "stable")
+        result["message"] = (f"No {channel} releases are available. The source checkout will still sync; "
+                             "existing release downloads are retained.")
     return result
+
+
+def discover(repository, release_policy=_NEW_POLICY):
+    """Fetch all published type descriptions without downloading release assets."""
+    return preview(repository, 100, release_policy=release_policy, types_only=True)

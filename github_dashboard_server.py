@@ -19,10 +19,34 @@ import github_dashboard as dashboard
 import github_management as management
 import github_asset_preview as asset_preview
 import github_progress as progress
+import github_refresh as release_refresh
+import github_delete as sync_delete
 from github_sources import parse_repository
 
 
 IDLE_SECONDS = 600
+RELEASE_OPTIONS = ("include_prereleases", "separate_release_limits", "stable_last",
+                   "prerelease_last", "release_policy")
+ADD_REVIEW_SECONDS = 900
+
+
+def _add_arguments(body):
+    branch, start_time = body.get("branch"), body.get("start_time")
+    return {"repository": body.get("repository"), "asset_patterns": body.get("asset_patterns"),
+            "every_minutes": body.get("every_minutes"), "last": body.get("last"),
+            "branch": None if branch == "" else branch, "source_only": body.get("source_only", False),
+            "start_time": None if start_time == "" else start_time, "run_now": body.get("run_now", True),
+            **{key: body[key] for key in RELEASE_OPTIONS if key in body}}
+
+
+def _add_signature(repository, job, run_now):
+    return hashlib.sha256(json.dumps([repository, job, run_now], sort_keys=True).encode("utf-8")).hexdigest()
+
+
+def _add_operation(operation, arguments):
+    values = dict(arguments)
+    positional = [values.pop(key) for key in ("repository", "asset_patterns", "every_minutes", "last")]
+    return operation(*positional, **values)
 
 
 def code_version(directory=None):
@@ -31,12 +55,13 @@ def code_version(directory=None):
     digest = hashlib.sha256()
     for name in ("github_dashboard.py", "github_management.py", "github_storage.py",
                  "github_dashboard_server.py", "github_sync.py", "github_progress.py",
-                 "github_asset_preview.py", "github_sources.py", "github_asset_history.py", "github_forgejo.py"):
+                 "github_asset_preview.py", "github_sources.py", "github_asset_history.py", "github_forgejo.py",
+                 "github_releases.py", "github_refresh.py", "github_release_catalog.py", "github_delete.py"):
         digest.update(name.encode("utf-8") + b"\0")
         try:
             content = (directory / name).read_bytes()
         except FileNotFoundError:
-            if name not in {"github_storage.py", "github_progress.py", "github_asset_preview.py", "github_sources.py", "github_asset_history.py", "github_forgejo.py"}:
+            if name not in {"github_storage.py", "github_progress.py", "github_asset_preview.py", "github_sources.py", "github_asset_history.py", "github_forgejo.py", "github_releases.py", "github_refresh.py", "github_release_catalog.py", "github_delete.py"}:
                 raise
             content = b"<not-installed>"
         digest.update(content + b"\0")
@@ -61,6 +86,7 @@ class DashboardServer(ThreadingHTTPServer):
         self.version = CODE_VERSION
         self.last_request = time.monotonic()
         self.schedule_cache = {}
+        self.add_reviews = {}
         self.cache_lock = threading.Lock()
         self.action_lock = threading.Lock()
         self.preview_lock = threading.Lock()
@@ -101,6 +127,8 @@ class DashboardServer(ThreadingHTTPServer):
         with ThreadPoolExecutor(max_workers=4) as pool:
             for row, result in zip(data["rows"], pool.map(schedule, data["rows"])):
                 row["schedule"] = result
+                row["first_sync"] = release_refresh.progress_snapshot(
+                    self.base, row["repository"], row.get("first_sync"))
         return data
 
     def progress_snapshot(self):
@@ -108,13 +136,60 @@ class DashboardServer(ThreadingHTTPServer):
         config = self.base / "sync-config.json"
         jobs = json.loads(config.read_text(encoding="utf-8")) if config.exists() else {}
         return {"generated_at": dashboard.now(), "progress": {
-            repository: progress.snapshot(self.base, repository) for repository in jobs}}
+            repository: release_refresh.progress_snapshot(
+                self.base, repository, progress.snapshot(self.base, repository)) for repository in jobs}}
 
     def asset_preview(self, body):
         if not isinstance(body, dict):
             raise ValueError("Expected a JSON object")
+        channel = {key: body[key] for key in RELEASE_OPTIONS if key in body}
         return asset_preview.preview(body.get("repository"), body.get("last"),
-                                     body.get("source_only", False))
+                                     body.get("source_only", False), **channel)
+
+    def release_types(self, body):
+        """Discover all remote types, including excluded ones, without saving."""
+        import github_sync as sync
+        repository = management.normalize_repository(body.get("repository"))
+        jobs = sync.load_config() if sync.CONFIG.exists() else {}
+        job = jobs.get(repository)
+        options = {key: body[key] for key in RELEASE_OPTIONS if key in body}
+        if job is not None:
+            defaults = {"release_policy": job.get("release_policy"),
+                        "include_prereleases": job.get("include_prereleases", True),
+                        "separate_release_limits": job.get("separate_release_limits", False),
+                        "stable_last": job.get("stable_last", job["last"]),
+                        "prerelease_last": job.get("prerelease_last", job["last"])}
+            options = {**defaults, **options}
+        return asset_preview.preview(repository, body.get("last", job["last"] if job else 5),
+                                     False, types_only=True, **options)
+
+    def review_add(self, body):
+        result = _add_operation(management.preview_add_sync, _add_arguments(body))
+        now = time.monotonic()
+        reviews = {key: value for key, value in getattr(self, "add_reviews", {}).items()
+                   if now - value["created"] < ADD_REVIEW_SECONDS}
+        while len(reviews) >= 16:
+            del reviews[min(reviews, key=lambda key: reviews[key]["created"])]
+        token = secrets.token_urlsafe(24)
+        reviews[token] = {"created": now, "signature": _add_signature(
+            result["repository"], result["job"], result["run_now"]),
+            "release_types": result["assets"].get("release_types", [])}
+        self.add_reviews = reviews
+        return {**result, "review_token": token, "expires_in": ADD_REVIEW_SECONDS}
+
+    def confirmed_add(self, body):
+        token = body.get("review_token")
+        review = getattr(self, "add_reviews", {}).get(token) if isinstance(token, str) else None
+        if not review or time.monotonic() - review["created"] >= ADD_REVIEW_SECONDS:
+            raise ValueError("Review this sync setup again before adding it; the setup review is missing or expired.")
+        arguments = _add_arguments(body)
+        repository, job = management._prepare_add(**arguments, detect=False)
+        if _add_signature(repository, job, arguments["run_now"]) != review["signature"]:
+            raise ValueError("Sync setup changed. Review the updated setup before adding it.")
+        result = _add_operation(management.add_sync, {
+            **arguments, "_catalog_descriptors": review["release_types"]})
+        del self.add_reviews[token]
+        return result
 
     def action(self, body):
         if not isinstance(body, dict):
@@ -125,16 +200,14 @@ class DashboardServer(ThreadingHTTPServer):
         import github_sync as sync
         # Adding has its own strict repository validation and duplicate checks.
         # Other actions continue to operate on a configured repository only.
-        if action != "add" and repository not in sync.load_config():
+        if action not in {"add", "add-preview", "release-types"} and repository not in sync.load_config():
             raise ValueError("This sync is no longer configured. Refresh the dashboard.")
+        if action == "release-types":
+            return self.release_types(body)
+        if action == "add-preview":
+            return self.review_add(body)
         if action == "add":
-            branch, start_time = body.get("branch"), body.get("start_time")
-            result = management.add_sync(
-                repository, body.get("asset_patterns"), body.get("every_minutes"), body.get("last"),
-                branch=None if branch == "" else branch,
-                source_only=body.get("source_only", False),
-                start_time=None if start_time == "" else start_time,
-                run_now=body.get("run_now", True))
+            result = self.confirmed_add(body)
             repository = result["repository"]
             message = ("Sync added. The first sync was launched in the background."
                        if result.get("started") else "Sync added. Scheduled syncing is enabled.")
@@ -143,20 +216,35 @@ class DashboardServer(ThreadingHTTPServer):
             message = "Asset patterns saved for future syncs. Existing downloads are kept."
         elif action in {"settings", "resume"}:
             operation = management.update_settings if action == "settings" else management.resume_sync
+            channel = {key: body[key] for key in RELEASE_OPTIONS if key in body}
             result = operation(repository, body.get("every_minutes"), body.get("last"),
-                               body.get("start_time") or None)
+                               body.get("start_time") or None, **channel)
             message = "Sync settings saved." if action == "settings" else "Sync resumed."
         elif action == "archive":
             result = management.archive_sync(repository)
             message = "Sync archived; its scheduled task was removed. Local files are preserved."
         elif action == "remove":
             result = management.remove_sync(repository)
-            message = "Sync removed from the dashboard. Local files are preserved."
+            message = ("Sync deleted from the dashboard. Local files are preserved."
+                       if result.get("removed") else "Delete sync stopped; the sync remains archived.")
+        elif action == "delete-preview":
+            return sync_delete.preview(repository, body.get("delete_files", False))
+        elif action == "delete":
+            result = sync_delete.delete(repository, body.get("delete_files", False), body.get("token"))
+            message = ("Sync deleted, including its local source checkout and releases."
+                       if result.get("removed") and result.get("delete_files") else
+                       "Sync deleted from the dashboard. Local files are preserved."
+                       if result.get("removed") else "Delete sync stopped; the sync remains archived.")
         elif action == "cleanup-preview":
             return management.cleanup_preview(repository, body.get("count"))
         elif action == "cleanup":
             result = management.cleanup_releases(repository, body.get("count"), body.get("token"))
             message = "Release cleanup completed."
+        elif action == "refresh-preview":
+            return release_refresh.preview(repository)
+        elif action == "refresh":
+            result = release_refresh.start(repository, body.get("token"))
+            message = "Release refresh launched in the background. The source checkout and Git history are kept."
         elif action == "assets-cleanup-preview":
             return management.cleanup_assets_preview(repository)
         elif action == "assets-cleanup":
@@ -192,7 +280,7 @@ class DashboardServer(ThreadingHTTPServer):
         except Exception as error:
             # The mutation has already committed; avoid presenting a successful
             # add/save as failed and prompting a duplicate retry.
-            warning = f"Saved successfully, but the dashboard could not refresh: {error}. Refresh to reload it."
+            warning = f"Action finished, but the dashboard could not refresh: {error}. Refresh to reload it."
             response["warning"] = " ".join(filter(None, [response.get("warning"), warning]))
         return response
 

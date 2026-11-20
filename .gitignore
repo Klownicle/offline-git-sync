@@ -12,10 +12,14 @@
 !/github_asset_preview.py
 !/github_dashboard.py
 !/github_dashboard_server.py
+!/github_delete.py
 !/github_forgejo.py
 !/github_https.py
 !/github_management.py
 !/github_progress.py
+!/github_refresh.py
+!/github_releases.py
+!/github_release_catalog.py
 !/github_sources.py
 !/github_storage.py
 !/github_sync.py
