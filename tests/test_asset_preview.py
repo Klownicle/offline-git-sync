@@ -70,7 +70,7 @@ class AssetPreviewTests(unittest.TestCase):
             release("vpreview", "2026-11-10T00:00:00Z", prerelease=True),
             release("vstable", "2026-11-09T00:00:00Z"),
             release("vundated", None)])
-        result = preview.preview("owner/repo", 2)
+        result = preview.preview("owner/repo", 2, include_prereleases=True)
         self.assertEqual([row["tag"] for row in result["releases"]], ["vpreview", "vstable"])
         self.assertTrue(result["releases"][0]["prerelease"])
 

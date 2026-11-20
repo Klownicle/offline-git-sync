@@ -163,11 +163,11 @@ class EdenPreviewTests(unittest.TestCase):
         self.assertEqual(network.call_count, 3)
         self.assertEqual([row["tag"] for row in result["releases"]], ["published"])
 
-    def test_github_preview_keeps_existing_draft_handling(self):
+    def test_github_preview_excludes_drafts_like_other_hosts(self):
         with patch.object(preview, "urlopen", return_value=response([release("draft", draft=True)])) as network:
             result = preview.preview("owner/repo", 1)
         network.assert_called_once()
-        self.assertEqual([row["tag"] for row in result["releases"]], ["draft"])
+        self.assertEqual(result["releases"], [])
 
     def test_preview_uses_same_pagination_ordering_and_assets_as_sync(self):
         older = release("v-old", "2026-11-10T12:00:00+02:00")

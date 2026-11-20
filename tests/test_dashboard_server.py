@@ -11,6 +11,7 @@ from unittest import mock
 
 import github_dashboard as dashboard
 import github_dashboard_server as dashboard_server
+import github_delete as sync_delete
 import github_management as management
 import github_sync as sync
 
@@ -235,13 +236,136 @@ class DashboardHTTPTests(unittest.TestCase):
 
     def test_archive_and_remove_only_forward_selected_repository(self):
         for action, operation in [("archive", "archive_sync"), ("remove", "remove_sync")]:
-            with self.subTest(action=action), mock.patch.object(management, operation, return_value={}) as call:
+            result = {"archived": True} if action == "archive" else {"removed": True, "data_preserved": True}
+            with self.subTest(action=action), mock.patch.object(management, operation, return_value=result) as call:
                 self.server.schedule_cache[self.repository] = ("cached", 0, {})
                 status, content, _ = self.post({"action": action, "repository": self.repository})
                 self.assertEqual(status, 200)
                 call.assert_called_once_with(self.repository)
                 self.assertNotIn(self.repository, self.server.schedule_cache)
                 self.assertIn("preserved", json.loads(content)["message"])
+
+    def test_delete_preview_defaults_to_keep_files_and_returns_exact_preview(self):
+        for supplied, expected in [(None, False), (False, False), (True, True)]:
+            preview = {"repository": self.repository, "token": "deletion-preview-proof",
+                       "delete_files": expected, "paths": [
+                           {"kind": "source", "path": str(self.base / "test-owner" / "test-repo")},
+                           {"kind": "releases", "path": str(self.base / "test-owner" / "test-repo-releases")}],
+                       "bytes": 12 if expected else None, "file_count": 2 if expected else None}
+            body = {"action": "delete-preview", "repository": self.repository}
+            if supplied is not None:
+                body["delete_files"] = supplied
+            with self.subTest(supplied=supplied), mock.patch.object(sync_delete, "preview", return_value=preview) as call:
+                status, content, _ = self.post(body)
+                self.assertEqual(status, 200)
+                self.assertEqual(json.loads(content), preview)
+                call.assert_called_once_with(self.repository, expected)
+        self.server.snapshot.assert_not_called()
+
+    def test_delete_routes_require_authentication_before_preview_or_deletion(self):
+        with mock.patch.object(sync_delete, "preview") as preview, mock.patch.object(sync_delete, "delete") as delete:
+            for action in ("delete-preview", "delete"):
+                for headers in ({"X-Dashboard-Token": None}, {"X-Dashboard-Token": "wrong"},
+                                {"Origin": "https://attacker.example"}):
+                    with self.subTest(action=action, headers=headers):
+                        status, _, _ = self.post({"action": action, "repository": self.repository,
+                                                 "delete_files": True, "token": "preview-proof"}, headers)
+                        self.assertEqual(status, 403)
+            preview.assert_not_called()
+            delete.assert_not_called()
+
+    def test_delete_routes_reject_nonboolean_file_choices_before_filesystem_work(self):
+        # Exercise the real strict validators, stopping any unexpected file/task work.
+        with mock.patch.object(management, "_locked", side_effect=AssertionError("No filesystem/task access")) as locked, \
+                mock.patch.object(management, "_sync", side_effect=AssertionError("No sync access")) as loaded:
+            for action in ("delete-preview", "delete"):
+                for value in (None, 0, 1, "false", "true", [], {}):
+                    with self.subTest(action=action, value=value):
+                        status, content, _ = self.post({"action": action, "repository": self.repository,
+                                                       "delete_files": value, "token": "preview-proof"})
+                        self.assertEqual(status, 400)
+                        self.assertIn("must be true or false", json.loads(content)["error"])
+                        self.assertFalse(self.server.action_lock.locked())
+            locked.assert_not_called()
+            loaded.assert_not_called()
+
+    def test_delete_requires_a_preview_token_before_filesystem_work(self):
+        with mock.patch.object(management, "_locked", side_effect=AssertionError("No filesystem/task access")) as locked, \
+                mock.patch.object(management, "_sync", side_effect=AssertionError("No sync access")) as loaded:
+            status, content, _ = self.post({"action": "delete", "repository": self.repository})
+            self.assertEqual(status, 400)
+            self.assertIn("preview is missing or expired", json.loads(content)["error"])
+            locked.assert_not_called()
+            loaded.assert_not_called()
+
+    def test_delete_forwards_only_repository_choice_and_token_and_reports_success(self):
+        for supplied, expected in [(None, False), (False, False), (True, True)]:
+            body = {"action": "delete", "repository": self.repository, "token": "reviewed-delete-proof",
+                    "paths": ["C:/untrusted-client-path"]}
+            if supplied is not None:
+                body["delete_files"] = supplied
+            result = {"removed": True, "archived": False, "delete_files": expected,
+                      "files_deleted": ["exact-reviewed-source", "exact-reviewed-releases"] if expected else []}
+            with self.subTest(supplied=supplied), mock.patch.object(sync_delete, "delete", return_value=result) as call:
+                self.server.schedule_cache[self.repository] = ("cached", 0, {})
+                status, content, _ = self.post(body)
+                self.assertEqual(status, 200)
+                call.assert_called_once_with(self.repository, expected, "reviewed-delete-proof")
+                response = json.loads(content)
+                self.assertTrue(response["removed"])
+                self.assertEqual(response["files_deleted"], result["files_deleted"])
+                self.assertEqual(response["data"], self.data)
+                self.assertIn("including its local source" if expected else "Local files are preserved", response["message"])
+                self.assertNotIn(self.repository, self.server.schedule_cache)
+
+    def test_delete_partial_failure_retains_archived_outcome_and_remaining_paths(self):
+        result = {"removed": False, "archived": True, "partial": True, "delete_files": True,
+                  "files_deleted": ["source-path"], "affected_path": "release-path",
+                  "remaining_paths": ["release-path"], "deleted_file_count": 2,
+                  "deleted_bytes": 1024, "warning": "A release file is locked. Sync remains archived."}
+        with mock.patch.object(sync_delete, "delete", return_value=result):
+            status, content, _ = self.post({"action": "delete", "repository": self.repository,
+                                            "delete_files": True, "token": "preview-proof"})
+        self.assertEqual(status, 200)
+        response = json.loads(content)
+        for key, value in result.items():
+            self.assertEqual(response[key], value)
+        self.assertEqual(response["data"], self.data)
+        self.assertIn("stopped", response["message"])
+        self.assertIn("remains archived", response["message"])
+        self.assertNotIn("Sync deleted", response["message"])
+
+    def test_delete_snapshot_failure_preserves_committed_and_partial_results(self):
+        self.server.snapshot.side_effect = OSError("inventory refresh unavailable")
+        for removed in (True, False):
+            result = {"removed": removed, "archived": not removed, "partial": not removed,
+                      "delete_files": True, "files_deleted": ["source-path"],
+                      "remaining_paths": [] if removed else ["release-path"],
+                      "warning": "Original deletion warning."}
+            with self.subTest(removed=removed), mock.patch.object(sync_delete, "delete", return_value=result):
+                status, content, _ = self.post({"action": "delete", "repository": self.repository,
+                                                "delete_files": True, "token": "preview-proof"})
+                self.assertEqual(status, 200)
+                response = json.loads(content)
+                for key in ("removed", "archived", "partial", "files_deleted", "remaining_paths"):
+                    self.assertEqual(response[key], result[key])
+                self.assertNotIn("data", response)
+                self.assertIn("Original deletion warning.", response["warning"])
+                self.assertIn("inventory refresh unavailable", response["warning"])
+                if not removed:
+                    self.assertIn("stopped", response["message"])
+                    self.assertNotIn("Sync deleted", response["message"])
+
+    def test_delete_routes_cannot_target_an_unconfigured_repository(self):
+        with mock.patch.object(sync_delete, "preview") as preview, mock.patch.object(sync_delete, "delete") as delete:
+            for action in ("delete-preview", "delete"):
+                with self.subTest(action=action):
+                    status, content, _ = self.post({"action": action, "repository": "another/repo",
+                                                   "delete_files": True, "token": "preview-proof"})
+                    self.assertEqual(status, 400)
+                    self.assertIn("no longer configured", json.loads(content)["error"])
+            preview.assert_not_called()
+            delete.assert_not_called()
 
     def test_cleanup_requires_preview_token_forwarding(self):
         preview = {"token": "cleanup-proof", "count": 2, "releases": [{"tag_name": "v1"}]}

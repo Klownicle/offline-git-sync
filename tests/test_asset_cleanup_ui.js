@@ -28,6 +28,15 @@ function notice(message,error,warning){messages.push({message,error,warning})}
 function renderManager(row){renderCalls.push(row)}
 function refresh(){return Promise.resolve()}
 function updatePatternControls(){}
+function clearReleaseRefreshPreview(){}
+function updateReleaseRefreshAvailability(){}
+function previewReleaseRefresh(){}
+function clearDeleteSyncPreview(){}
+function closeDeleteSync(){}
+function openDeleteSync(){}
+function clearAddSyncReview(){}
+function policyEditorHTML(){return ""}
+function bindPolicyEditor(){}
 function renderAssetMatches(){}
 function patternRowHTML(value){return '<input value="'+esc(value)+'">'}
 `, context);

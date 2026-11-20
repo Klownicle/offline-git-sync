@@ -25,6 +25,9 @@ class AddSyncHTTPTests(unittest.TestCase):
         self.stack.enter_context(mock.patch.object(sync, "BASE", self.base))
         self.stack.enter_context(mock.patch.object(sync, "CONFIG", self.base / "sync-config.json"))
         self.stack.enter_context(mock.patch.object(management, "_render"))
+        self.stack.enter_context(mock.patch.object(management, "_task_xml", return_value=None))
+        self.stack.enter_context(mock.patch.object(server_module.asset_preview, "preview", return_value={
+            "releases": [], "release_types": [], "fetched_at": "2026-11-20T00:00:00Z"}))
         self.stack.enter_context(mock.patch.object(management, "_task_command",
             side_effect=AssertionError("Tests must not access Windows Task Scheduler")))
         self.stack.enter_context(mock.patch.object(sync.subprocess, "Popen",
@@ -51,7 +54,12 @@ class AddSyncHTTPTests(unittest.TestCase):
     def write_config(self, value):
         sync.CONFIG.write_text(json.dumps(value), encoding="utf-8")
 
-    def post(self, body, headers=None):
+    def post(self, body, headers=None, *, review=True):
+        if review and body.get("action") == "add" and "review_token" not in body:
+            status, preview = self.post({**body, "action": "add-preview"}, headers, review=False)
+            if status != 200:
+                return status, preview
+            body = {**body, "review_token": preview["review_token"]}
         actual = {"Content-Type": "application/json", "Origin": self.server.origin,
                   "X-Dashboard-Token": self.server.token}
         actual.update(headers or {})
@@ -116,16 +124,15 @@ class AddSyncHTTPTests(unittest.TestCase):
         self.assertEqual(response["repository"], result["repository"])
         self.assertNotIn(result["repository"], self.server.schedule_cache)
 
-    def test_explicit_empty_null_and_false_add_values_are_not_coerced(self):
-        operation = management.add_sync
+    def test_explicit_empty_null_and_false_add_values_are_rejected_by_review(self):
         for key, value in [("asset_patterns", []), ("asset_patterns", None),
                            ("start_time", False), ("source_only", None), ("run_now", None),
                            ("every_minutes", False), ("last", 0)]:
             with self.subTest(key=key, value=value), \
                     mock.patch.object(management, "add_sync", return_value={
                         "repository": "new-owner/new-repo"}) as call:
-                self.assertEqual(self.post(self.add_body(**{key: value}))[0], 200)
-                self.assertEqual(self.bound_arguments(operation, call)[key], value)
+                self.assertEqual(self.post(self.add_body(**{key: value}))[0], 400)
+                call.assert_not_called()
 
     def test_blank_optional_clock_and_branch_mean_unspecified(self):
         operation = management.add_sync

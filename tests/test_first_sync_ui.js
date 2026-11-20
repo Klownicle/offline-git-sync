@@ -21,7 +21,7 @@ const context = vm.createContext({
 vm.runInContext(lines.filter(line => line.startsWith('const $=') ||
   line.startsWith('const date=') || line.startsWith('const exact=') ||
   line.startsWith('const activeFirst=') || names.some(name => line.startsWith(`function ${name}(`))).join('\n'), context);
-vm.runInContext('let data={rows:[]}, assetPreview=null, enteredPatterns=[]; function rawPatterns(){return enteredPatterns} function updateAssetCleanupAvailability(){}', context);
+vm.runInContext('let data={rows:[]}, assetPreview=null, enteredPatterns=[]; function rawPatterns(){return enteredPatterns} function updateAssetCleanupAvailability(){} function updateReleaseRefreshAvailability(){}', context);
 const run = expression => vm.runInContext(expression, context);
 let checks = 0;
 function test(name, fn) { fn(); checks++; console.log(`PASS ${name}`); }

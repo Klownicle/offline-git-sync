@@ -7,6 +7,7 @@ import subprocess
 import tempfile
 from types import SimpleNamespace
 import unittest
+import xml.etree.ElementTree as ET
 from unittest.mock import Mock, patch
 
 import github_dashboard as dashboard
@@ -211,7 +212,15 @@ class ManagementTests(unittest.TestCase):
         source.mkdir()
         (source / "local.txt").write_text("local edit", encoding="utf-8")
         self.write_jobs({self.repository: self.job, "another/repo": self.job})
-        with patch.object(management, "_task_xml", return_value=XML), patch.object(management, "_delete_task") as delete:
+        namespace = "http://schemas.microsoft.com/windows/2004/02/mit/task"
+        task = ET.fromstring(XML)
+        actions = ET.SubElement(task, f"{{{namespace}}}Actions")
+        action = ET.SubElement(actions, f"{{{namespace}}}Exec")
+        ET.SubElement(action, f"{{{namespace}}}Command").text = str(Path(sync.sys.executable).with_name("pythonw.exe"))
+        ET.SubElement(action, f"{{{namespace}}}Arguments").text = subprocess.list2cmdline([
+            str(Path(sync.__file__).resolve()), "run-saved", self.repository])
+        with patch.object(management, "_task_xml", return_value=ET.tostring(task, encoding="unicode")), \
+                patch.object(management, "_delete_task") as delete:
             management.remove_sync(self.repository)
         delete.assert_called_once()
         self.assertEqual(set(sync.load_config()), {"another/repo"})

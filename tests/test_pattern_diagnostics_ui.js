@@ -28,7 +28,7 @@ const context = vm.createContext({document: {getElementById: node}, navigator, c
   fetch: async () => ({ok: false, status: 409, json: async () => fetchResult})});
 vm.runInContext(script.split(/\r?\n/).filter(line => line.startsWith('const $=') ||
   names.some(name => line.startsWith(`function ${name}(`) || line.startsWith(`async function ${name}(`))).join('\n'), context);
-vm.runInContext(`const management={token:'page-auth-token-must-not-copy'};let busy=false,dataVersion=0,selected='owner/repo',assetPreview={draft:'kept'};function setBusy(value){busy=value}function pollProgress(){}function clearAssetCleanupPreview(){}function updateAssetCleanupAvailability(){}function draw(){throw new Error('Conflict must not redraw forms')}`, context);
+vm.runInContext(`const management={token:'page-auth-token-must-not-copy'};let busy=false,dataVersion=0,selected='owner/repo',assetPreview={draft:'kept'};function setBusy(value){busy=value}function pollProgress(){}function clearAssetCleanupPreview(){}function updateAssetCleanupAvailability(){}function clearReleaseRefreshPreview(){}function clearDeleteSyncPreview(){}function updateReleaseRefreshAvailability(){}function draw(){throw new Error('Conflict must not redraw forms')}`, context);
 const run = code => vm.runInContext(code, context);
 let checks = 0;
 async function test(name, fn) {await fn(); checks++; console.log(`PASS ${name}`)}
