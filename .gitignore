@@ -1,0 +1,46 @@
+# This tool can share its folder with downloaded repositories and runtime data.
+# Publish only the maintained source, documentation, and test files below.
+/*
+!/.gitignore
+!/.gitattributes
+!/README.md
+!/CONTRIBUTING.md
+!/LICENSE
+!/requirements.txt
+!/install.py
+!/github_asset_history.py
+!/github_asset_preview.py
+!/github_dashboard.py
+!/github_dashboard_server.py
+!/github_forgejo.py
+!/github_https.py
+!/github_management.py
+!/github_progress.py
+!/github_sources.py
+!/github_storage.py
+!/github_sync.py
+!/docs/
+!/tests/
+
+# Allow only documentation, the supplied screenshot, tests, and fixed fixtures.
+/docs/**
+!/docs/*.md
+!/docs/images/
+!/docs/images/dashboard.png
+/tests/*
+!/tests/test_*.py
+!/tests/test_*.js
+!/tests/*-fixture.json
+
+# Also protect against accidentally adding generated files in allowed folders.
+__pycache__/
+*.py[cod]
+.tools/
+.sync-state/
+sync-config.json
+sync.log
+dashboard.html
+Open dashboard.vbs
+*.tmp
+*.part
+*.log
