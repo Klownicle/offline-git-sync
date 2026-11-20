@@ -27,7 +27,9 @@
 !/docs/*.md
 !/docs/images/
 !/docs/images/dashboard.png
+!/docs/images/README.md
 /tests/*
+!/tests/README.md
 !/tests/test_*.py
 !/tests/test_*.js
 !/tests/*-fixture.json
